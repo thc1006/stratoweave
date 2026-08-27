@@ -6,7 +6,9 @@ transaction envelope (the wrong kind) to force the out-of-sync path; the
 header-only test answers a transaction request the way etcd answers a failed
 one, which must be accepted rather than mistaken for a mismatch. The scan test
 answers with a page of three rows and never ranges again, so what a scan does
-with the page it already holds is all that decides the reads.
+with the page it already holds is all that decides the reads. The get test
+answers with a row for a key it never asked for, which is what a range answer
+landing on another range request looks like from inside a point get.
 """
 
 import net
@@ -28,7 +30,9 @@ TXN_ENVELOPE = b"{\"succeeded\":true,\"responses\":[]}"
 HEADER_ONLY = b"{\"header\":{\"revision\":\"1\"}}"
 
 # A range reply that matches a range request, for the happy path: a well-formed
-# answer must be delivered, and the request behind it sent exactly once.
+# answer must be delivered, and the request behind it sent exactly once. Its one
+# row is key "A", which no test asks for, so a point get can tell it is not its
+# own row.
 RANGE_BODY = b"{\"header\":{\"revision\":\"1\"},\"kvs\":[{\"key\":\"QQ==\",\"value\":\"Yg==\"}],\"count\":\"1\"}"
 
 # A three-row page under prefix "p/" (keys p/a, p/b, p/c) with no continuation,
@@ -670,6 +674,81 @@ actor etcd_reader_seek_ge_repositions_within_page(t: testing.EnvT):
         if done:
             return
         fail("timed out reading the scan")
+
+    bind()
+    after 10.0: timeout()
+
+
+actor etcd_get_rejects_a_row_for_another_key(t: testing.EnvT):
+    """A point get fails on a row for a key it did not ask for.
+
+    The mock answers every range with its one row for key "A", so a get of "a"
+    under prefix "p/" is answered with a row for a key it never asked for. That
+    is what a range answer shifted onto another range request looks like from
+    inside a get, and the envelope check cannot see it because both requests
+    are ranges. The pre-fix get read the value out of whatever row came back.
+    """
+    listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap)))
+    connect_cap = net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap)))
+
+    var attempts = 0
+    var bind_port = 0
+    var done = False
+    var store: ?swetcd.EtcdStore = None
+    var server: ?MockEtcdServer = None
+
+    def drop(error: ?Exception) -> None:
+        pass
+
+    def teardown() -> None:
+        s = store
+        if s is not None:
+            s.close(drop)
+        srv = server
+        if srv is not None:
+            srv.close()
+
+    def fail(message: str) -> None:
+        if done:
+            return
+        done = True
+        teardown()
+        t.failure(ValueError(message))
+
+    def succeed() -> None:
+        if done:
+            return
+        done = True
+        teardown()
+        t.success()
+
+    def got_value(value: ?bytes, error: ?Exception) -> None:
+        if error is None:
+            fail("a row for another key must fail the get, it returned {value}")
+            return
+        succeed()
+
+    def bind() -> None:
+        attempts += 1
+        p = random.randint(20000, 45000)
+        bind_port = p
+        server = MockEtcdServer(listen_cap, p, RANGE_BODY, on_ready)
+
+    def on_ready(error: ?str) -> None:
+        if error is not None:
+            if attempts < 10:
+                bind()
+            else:
+                fail("mock server could not bind after {attempts} attempts: {error}")
+            return
+        st = swetcd.EtcdStore(connect_cap, "127.0.0.1", bind_port, b"p")
+        store = st
+        st.get(b"a", got_value)
+
+    def timeout() -> None:
+        if done:
+            return
+        fail("timed out reading the get")
 
     bind()
     after 10.0: timeout()

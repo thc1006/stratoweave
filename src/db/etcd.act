@@ -251,6 +251,15 @@ actor EtcdGet(
     key: bytes,
     done: action(?bytes, ?Exception) -> None
 ):
+    """Read one key, and check the row that comes back is that key.
+
+    The envelope check in EtcdClient catches a response that belongs to the
+    other request family, but a range answer shifted onto another range
+    request carries a range envelope either way. A point get knows the key it
+    asked for, so it can still tell, and a row for some other key is an error
+    rather than that key's value returned as this one's.
+    """
+
     def received(data: ?value, error: ?Exception) -> None:
         if error is not None:
             done(None, error)
@@ -262,6 +271,9 @@ actor EtcdGet(
                 done(None, None)
                 return
             row = obj(rows[0], "range row")
+            physical_key = as_bytes(row.get("key"), "range key", required=True)
+            if physical_key != prefix + key:
+                raise ValueError("Etcd returned a different key for a point get")
             done(as_bytes(row.get("value"), "range value"), None)
         except Exception as e:
             done(None, e)
