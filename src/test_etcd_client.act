@@ -8,7 +8,9 @@ one, which must be accepted rather than mistaken for a mismatch. The scan test
 answers with a page of three rows and never ranges again, so what a scan does
 with the page it already holds is all that decides the reads. The get test
 answers with a row for a key it never asked for, which is what a range answer
-landing on another range request looks like from inside a point get.
+landing on another range request looks like from inside a point get. The
+reader tests leave a request unanswered, so a read is still outstanding when
+the reader closes.
 """
 
 import net
@@ -49,9 +51,13 @@ actor MockEtcdServer(
     listen_cap: net.TCPListenCap,
     port: int,
     reply_body: bytes,
-    on_ready: action(?str) -> None
+    on_ready: action(?str) -> None,
+    answer: bool=True
 ):
     """Answers every request with one canned body and records activity.
+
+    With answer=False it takes a request and never replies, which leaves the
+    read that sent it outstanding for as long as a test needs it to be.
 
     Faults are recorded rather than ignored so a broken mock shows up in a
     failing test's diagnostics. A peer-initiated close is expected here (the
@@ -73,11 +79,12 @@ actor MockEtcdServer(
                 break
             buf = rest
             count += 1
-            conn.write(
-                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-                + b"Content-Length: " + str(len(reply_body)).encode() + b"\r\n\r\n"
-                + reply_body
-            )
+            if answer:
+                conn.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    + b"Content-Length: " + str(len(reply_body)).encode() + b"\r\n\r\n"
+                    + reply_body
+                )
 
     def on_error(conn: net.TCPListenConnection, message: str) -> None:
         faults.append(message)
@@ -749,6 +756,373 @@ actor etcd_get_rejects_a_row_for_another_key(t: testing.EnvT):
         if done:
             return
         fail("timed out reading the get")
+
+    bind()
+    after 10.0: timeout()
+
+
+actor etcd_reader_close_ends_reads_before_it_reports_closed(t: testing.EnvT):
+    """A read outstanding when the reader closes ends before the reader does.
+
+    The server takes the scan's range and never answers it, so the read is
+    still outstanding when the reader closes. Reader.close has to close the
+    scans it opened and only then report itself finished, so the scan's read
+    must end first. The pre-fix reader posted a close to each scan and
+    reported itself finished in the same breath, so its callback came first
+    and a caller could still drive a scan of a reader it was told had ended.
+    """
+    listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap)))
+    connect_cap = net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap)))
+
+    var attempts = 0
+    var bind_port = 0
+    var done = False
+    var read_ended = False
+    var handle: ?swdb.Scan = None
+    var reader: ?swdb.Reader = None
+    var store: ?swetcd.EtcdStore = None
+    var server: ?MockEtcdServer = None
+
+    def drop(error: ?Exception) -> None:
+        pass
+
+    def teardown() -> None:
+        s = store
+        if s is not None:
+            s.close(drop)
+        srv = server
+        if srv is not None:
+            srv.close()
+
+    def fail(message: str) -> None:
+        if done:
+            return
+        done = True
+        teardown()
+        t.failure(ValueError(message))
+
+    def succeed() -> None:
+        if done:
+            return
+        done = True
+        teardown()
+        t.success()
+
+    def reader_closed(error: ?Exception) -> None:
+        if done:
+            return
+        if error is not None:
+            fail("reader close reported {error}")
+            return
+        if not read_ended:
+            fail("reader close finished while a scan read was still outstanding")
+            return
+        succeed()
+
+    def read_done(record: ?(key: bytes, value: bytes), error: ?Exception) -> None:
+        if done:
+            return
+        if error is not None:
+            fail("the read of a closed scan errored: {error}")
+            return
+        if record is not None:
+            fail("the read of a closed scan returned a row")
+            return
+        read_ended = True
+
+    def close_reader() -> None:
+        if done:
+            return
+        r = reader
+        if r is not None:
+            r.close(reader_closed)
+
+    def wait_for_request() -> None:
+        if done:
+            return
+        s = server
+        if s is not None:
+            n = await async s.request_count()
+            if n > 0:
+                close_reader()
+                return
+        after 0.05: wait_for_request()
+
+    def bind() -> None:
+        attempts += 1
+        p = random.randint(20000, 45000)
+        bind_port = p
+        server = MockEtcdServer(listen_cap, p, SCAN_BODY, on_ready, answer=False)
+
+    def on_ready(error: ?str) -> None:
+        if error is not None:
+            if attempts < 10:
+                bind()
+            else:
+                fail("mock server could not bind after {attempts} attempts: {error}")
+            return
+        st = swetcd.EtcdStore(connect_cap, "127.0.0.1", bind_port, b"p")
+        store = st
+        r = st.read()
+        reader = r
+        h = r.scan(b"", None)
+        handle = h
+        # The range goes out and stays unanswered, so the read is outstanding
+        # when the reader closes.
+        h.next(read_done)
+        after 0.05: wait_for_request()
+
+    def timeout() -> None:
+        if done:
+            return
+        fail("timed out closing the reader")
+
+    bind()
+    after 10.0: timeout()
+
+
+actor etcd_reader_scan_after_close_reaches_nothing(t: testing.EnvT):
+    """A scan opened after the reader closed reads nothing and sends nothing.
+
+    The session refuses it, so it is never admitted and never ranges: the read
+    ends and the server sees no request at all. The pre-fix reader handed back
+    a live scan and posted it a close, which the caller's read could beat, so
+    a reader that had already reported itself closed still ranged etcd.
+    """
+    listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap)))
+    connect_cap = net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap)))
+
+    var attempts = 0
+    var bind_port = 0
+    var done = False
+    var handle: ?swdb.Scan = None
+    var reader: ?swdb.Reader = None
+    var store: ?swetcd.EtcdStore = None
+    var server: ?MockEtcdServer = None
+
+    def drop(error: ?Exception) -> None:
+        pass
+
+    def teardown() -> None:
+        s = store
+        if s is not None:
+            s.close(drop)
+        srv = server
+        if srv is not None:
+            srv.close()
+
+    def fail(message: str) -> None:
+        if done:
+            return
+        done = True
+        teardown()
+        t.failure(ValueError(message))
+
+    def succeed() -> None:
+        if done:
+            return
+        done = True
+        teardown()
+        t.success()
+
+    def verify_silent() -> None:
+        if done:
+            return
+        s = server
+        if s is not None:
+            n = await async s.request_count()
+            if n != 0:
+                fail("a scan opened after the reader closed ranged etcd {n} times")
+                return
+        succeed()
+
+    def read_after_close(record: ?(key: bytes, value: bytes), error: ?Exception) -> None:
+        if done:
+            return
+        if error is not None:
+            fail("the read of a refused scan errored: {error}")
+            return
+        if record is not None:
+            fail("a scan opened after the reader closed returned a row")
+            return
+        after 0.3: verify_silent()
+
+    def reader_closed(error: ?Exception) -> None:
+        if done:
+            return
+        if error is not None:
+            fail("reader close reported {error}")
+            return
+        r = reader
+        if r is not None:
+            h = r.scan(b"", None)
+            handle = h
+            h.next(read_after_close)
+
+    def bind() -> None:
+        attempts += 1
+        p = random.randint(20000, 45000)
+        bind_port = p
+        server = MockEtcdServer(listen_cap, p, SCAN_BODY, on_ready)
+
+    def on_ready(error: ?str) -> None:
+        if error is not None:
+            if attempts < 10:
+                bind()
+            else:
+                fail("mock server could not bind after {attempts} attempts: {error}")
+            return
+        st = swetcd.EtcdStore(connect_cap, "127.0.0.1", bind_port, b"p")
+        store = st
+        r = st.read()
+        reader = r
+        r.close(reader_closed)
+
+    def timeout() -> None:
+        if done:
+            return
+        fail("timed out on the scan opened after close")
+
+    bind()
+    after 10.0: timeout()
+
+
+actor ScanOpener(reader: swdb.Reader, opened: action(swdb.Scan) -> None):
+    """Opens one scan from an actor of its own, the way a restore's readers do.
+
+    A restore opens every scan of a layer from one reader but from as many
+    node actors as its window allows, so the opens run in parallel and the
+    reader cannot name its scans from state of its own.
+    """
+
+    def open() -> None:
+        opened(reader.scan(b"", None))
+
+
+actor etcd_reader_close_ends_scans_opened_in_parallel(t: testing.EnvT):
+    """Closing a reader ends every scan, however many actors opened them.
+
+    Sixty-four actors open a scan each from one reader, then the reader is
+    closed twice. Both closes must be answered, every scan must read end of
+    range, and no scan may range etcd afterwards. The pre-fix reader numbered
+    its scans from a counter of its own that all of them read and wrote, so
+    two scans could take the same number and the reader would keep only one of
+    them; the other stayed open and served reads after the reader had closed.
+    """
+    listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap)))
+    connect_cap = net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap)))
+
+    OPENERS = 64
+
+    var attempts = 0
+    var bind_port = 0
+    var done = False
+    var closes = 0
+    var reads = 0
+    var handles: list[swdb.Scan] = []
+    var reader: ?swdb.Reader = None
+    var store: ?swetcd.EtcdStore = None
+    var server: ?MockEtcdServer = None
+
+    def drop(error: ?Exception) -> None:
+        pass
+
+    def teardown() -> None:
+        s = store
+        if s is not None:
+            s.close(drop)
+        srv = server
+        if srv is not None:
+            srv.close()
+
+    def fail(message: str) -> None:
+        if done:
+            return
+        done = True
+        teardown()
+        t.failure(ValueError(message))
+
+    def succeed() -> None:
+        if done:
+            return
+        done = True
+        teardown()
+        t.success()
+
+    def verify_silent() -> None:
+        if done:
+            return
+        s = server
+        if s is not None:
+            n = await async s.request_count()
+            if n != 0:
+                fail("scans of a closed reader ranged etcd {n} times")
+                return
+        succeed()
+
+    def read_ended(record: ?(key: bytes, value: bytes), error: ?Exception) -> None:
+        if done:
+            return
+        if error is not None:
+            fail("a read after the reader closed errored: {error}")
+            return
+        if record is not None:
+            fail("a scan of a closed reader returned a row")
+            return
+        reads += 1
+        if reads == OPENERS:
+            after 0.3: verify_silent()
+
+    def reader_closed(error: ?Exception) -> None:
+        if done:
+            return
+        if error is not None:
+            fail("reader close reported {error}")
+            return
+        closes += 1
+        if closes < 2:
+            return
+        for h in handles:
+            h.next(read_ended)
+
+    def opened(scan: swdb.Scan) -> None:
+        if done:
+            return
+        handles.append(scan)
+        if len(handles) < OPENERS:
+            return
+        r = reader
+        if r is not None:
+            # Twice, so a close arriving while the first is still draining is
+            # answered too rather than dropped.
+            r.close(reader_closed)
+            r.close(reader_closed)
+
+    def bind() -> None:
+        attempts += 1
+        p = random.randint(20000, 45000)
+        bind_port = p
+        server = MockEtcdServer(listen_cap, p, SCAN_BODY, on_ready)
+
+    def on_ready(error: ?str) -> None:
+        if error is not None:
+            if attempts < 10:
+                bind()
+            else:
+                fail("mock server could not bind after {attempts} attempts: {error}")
+            return
+        st = swetcd.EtcdStore(connect_cap, "127.0.0.1", bind_port, b"p")
+        store = st
+        r = st.read()
+        reader = r
+        openers = [ScanOpener(r, opened) for _ in range(OPENERS)]
+        for o in openers:
+            o.open()
+
+    def timeout() -> None:
+        if done:
+            return
+        fail("timed out: opened={len(handles)} closes={closes} reads={reads}")
 
     bind()
     after 10.0: timeout()

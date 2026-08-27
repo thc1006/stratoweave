@@ -288,9 +288,18 @@ actor EtcdScan(
     client: EtcdClient,
     prefix: bytes,
     start: bytes,
-    end: ?bytes
+    end: ?bytes,
+    forget: action(int) -> None
 ):
-    """Lazy etcd range scan, one page of ETCD_PAGE_SIZE rows at a time."""
+    """Lazy etcd range scan, one page of ETCD_PAGE_SIZE rows at a time.
+
+    A scan sends nothing until the reader's session has admitted it, so a
+    session that closed first can refuse it and no request goes out for a
+    reader that has already ended. On its own close the scan leaves the
+    session, and only then is the close complete, so a reader close waiting
+    on this scan hears from a scan that has finished rather than from one
+    that has merely been told to.
+    """
 
     start_key = prefix + start
     range_end = end_key(prefix, end)
@@ -302,6 +311,10 @@ actor EtcdScan(
     var request_serial = 0
     var pending_serial: ?int = None
     var closed = False
+    var admitted = False
+    var scan_id: ?int = None
+    var settled = False
+    var close_waiters: list[action(?Exception) -> None] = []
 
     def finish(record: ?(key: bytes, value: bytes), error: ?Exception) -> None:
         callback = waiting
@@ -309,11 +322,42 @@ actor EtcdScan(
         if callback is not None:
             callback(record, error)
 
+    def settle() -> None:
+        # The session is no longer holding this scan, so the close is done and
+        # everyone waiting on it is told, once.
+        settled = True
+        pending = close_waiters
+        close_waiters = []
+        for done in pending:
+            done(None)
+
+    def admit(assigned: ?int) -> None:
+        """Take the session's answer: an id, or None when the session closed."""
+        if assigned is None:
+            # The session ended before this scan reached it, so the scan never
+            # runs and there is nothing for the session to let go of.
+            closed = True
+            finish(None, None)
+            settle()
+            return
+        given = assigned!
+        scan_id = given
+        if closed:
+            # Closed while the answer was on its way; leave and finish now.
+            forget(given)
+            settle()
+            return
+        admitted = True
+        deliver()
+
     def deliver() -> None:
         if waiting is None:
             return
         if closed:
             finish(None, None)
+            return
+        if not admitted:
+            # Nothing goes out before the session has taken this scan on.
             return
         if row_index < len(rows):
             record = rows[row_index]
@@ -431,13 +475,23 @@ actor EtcdScan(
         deliver()
 
     def close(done: action(?Exception) -> None) -> None:
-        if not closed:
-            closed = True
-            request_serial += 1
-            pending_serial = None
-            rows = []
-            finish(None, None)
-        done(None)
+        if settled:
+            done(None)
+            return
+        close_waiters.append(done)
+        if closed:
+            # Already closed, still waiting on the session's answer to leave.
+            return
+        closed = True
+        admitted = False
+        request_serial += 1
+        pending_serial = None
+        rows = []
+        finish(None, None)
+        given = scan_id
+        if given is not None:
+            forget(given)
+            settle()
 
 
 actor EtcdWrite(
@@ -484,22 +538,99 @@ actor EtcdWrite(
     }, received)
 
 
+actor ReaderSession():
+    """Owns the scans a reader opens, and ends them when the reader closes.
+
+    A scan is a separate actor, so a reader that only posts a close to each of
+    its scans and then reports itself finished can be answered by a scan that
+    has not read that close yet, and the caller can still drive a scan of a
+    reader it was told had ended. The session is the one place that orders
+    this: it names the scans, so two opened at once cannot take the same name;
+    it refuses one opened after it closed, which is why a scan waits to be
+    admitted before it sends anything; and its close finishes only once every
+    scan it was holding has answered.
+    """
+
+    var scans: dict[int, EtcdScan] = {}
+    var next_id = 0
+    var closing = False
+    var finished = False
+    var outstanding = 0
+    var first_error: ?Exception = None
+    var waiters: list[action(?Exception) -> None] = []
+
+    def register(scan: EtcdScan) -> None:
+        if closing:
+            scan.admit(None)
+            return
+        id = next_id
+        next_id += 1
+        scans[id] = scan
+        scan.admit(id)
+
+    def forget(id: int) -> None:
+        if id in scans:
+            del scans[id]
+
+    def complete() -> None:
+        finished = True
+        pending = waiters
+        waiters = []
+        for done in pending:
+            done(first_error)
+
+    def scan_closed(error: ?Exception) -> None:
+        if error is not None and first_error is None:
+            first_error = error
+        outstanding -= 1
+        if outstanding == 0:
+            complete()
+
+    def close_all(done: action(?Exception) -> None) -> None:
+        if finished:
+            done(first_error)
+            return
+        waiters.append(done)
+        if closing:
+            # A close is already draining; this one finishes along with it.
+            return
+        closing = True
+        remaining = scans
+        scans = {}
+        outstanding = len(remaining)
+        if outstanding == 0:
+            complete()
+            return
+        for scan in remaining.values():
+            scan.close(scan_closed)
+
+
 class EtcdReader(swdb.Reader):
-    """Reader over an etcd store; scans read the current state."""
+    """Reader over an etcd store; scans read the current state.
+
+    A scan is a separate actor with its own in-flight requests, so the reader
+    hands every scan it opens to a session actor that owns them, and its close
+    ends that session, which closes any scan still open and waits for it, as
+    the contract requires.
+    """
 
     client: EtcdClient
     prefix: bytes
+    session: ReaderSession
 
     def __init__(self, client: EtcdClient, prefix: bytes):
         self.client = client
         self.prefix = prefix
+        self.session = ReaderSession()
 
     def scan(self, start: bytes, end: ?bytes) -> swdb.Scan:
-        scan = EtcdScan(self.client, self.prefix, start, end)
+        session = self.session
+        scan = EtcdScan(self.client, self.prefix, start, end, session.forget)
+        session.register(scan)
         return swdb.Scan(scan.next, scan.seek_ge, scan.close)
 
     def close(self, done: action(?Exception) -> None) -> None:
-        done(None)
+        self.session.close_all(done)
 
 
 class EtcdStore(swdb.Store):
