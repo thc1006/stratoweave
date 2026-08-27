@@ -90,8 +90,10 @@ def as_bytes(data: ?value, context: str, required: bool=False) -> bytes:
 def end_key(prefix: bytes, end: ?bytes) -> bytes:
     if end is not None:
         return prefix + end
-    # The prefix is never empty, so it always has a next key.
-    return swdb.next_prefix(prefix)!
+    nxt = swdb.next_prefix(prefix)
+    if nxt is not None:
+        return nxt
+    raise ValueError("Etcd store prefix must be non-empty and not all 0xFF bytes")
 
 
 actor EtcdClient(cap: net.TCPConnectCap, host: str, port: int):
@@ -389,17 +391,20 @@ actor EtcdScan(
         if closed:
             return
         target = prefix + (key if key >= start else start)
-        # The buffered page is sorted. A target within it is a local skip,
-        # and a target past it when no more pages exist is the end of the
-        # range; only a target past a page with more data needs a new page.
+        # The buffered page is sorted. A target within its key span repositions
+        # within the page, forward or back; a target past the page with no more
+        # pages is the end; a target before the page, or past a page with more,
+        # needs a fresh fetch from the target.
         if pending_serial is None and len(rows) > 0:
+            first = prefix + rows[0].key
             last = prefix + rows[len(rows) - 1].key
-            if target <= last:
+            if first <= target and target <= last:
+                row_index = 0
                 while row_index < len(rows) and prefix + rows[row_index].key < target:
                     row_index += 1
                 deliver()
                 return
-            if not more:
+            if target > last and not more:
                 position = target
                 rows = []
                 row_index = 0

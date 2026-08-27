@@ -1,10 +1,12 @@
-"""EtcdClient unit tests that need no running etcd.
+"""Etcd store unit tests that need no running etcd.
 
 A raw TCP server stands in for etcd and replies with a canned body, so these
 run in the normal suite. The mismatch tests answer a range request with a
 transaction envelope (the wrong kind) to force the out-of-sync path; the
 header-only test answers a transaction request the way etcd answers a failed
-one, which must be accepted rather than mistaken for a mismatch.
+one, which must be accepted rather than mistaken for a mismatch. The scan test
+answers with a page of three rows and never ranges again, so what a scan does
+with the page it already holds is all that decides the reads.
 """
 
 import net
@@ -28,6 +30,10 @@ HEADER_ONLY = b"{\"header\":{\"revision\":\"1\"}}"
 # A range reply that matches a range request, for the happy path: a well-formed
 # answer must be delivered, and the request behind it sent exactly once.
 RANGE_BODY = b"{\"header\":{\"revision\":\"1\"},\"kvs\":[{\"key\":\"QQ==\",\"value\":\"Yg==\"}],\"count\":\"1\"}"
+
+# A three-row page under prefix "p/" (keys p/a, p/b, p/c) with no continuation,
+# to drive a scan's cursor: base64 cC9h="p/a", cC9i="p/b", cC9j="p/c".
+SCAN_BODY = b"{\"header\":{\"revision\":\"1\"},\"kvs\":[{\"key\":\"cC9h\",\"value\":\"MQ==\"},{\"key\":\"cC9i\",\"value\":\"Mg==\"},{\"key\":\"cC9j\",\"value\":\"Mw==\"}],\"count\":\"3\"}"
 
 # Base64 keys for the range requests; the values do not matter because the
 # server never really ranges, it only ever replies with its canned body.
@@ -556,6 +562,114 @@ actor etcd_client_unknown_path_does_not_strand_siblings(t: testing.EnvT):
         if done:
             return
         fail("timed out: bad={got_bad} good={got_good}")
+
+    bind()
+    after 10.0: timeout()
+
+
+actor etcd_reader_seek_ge_repositions_within_page(t: testing.EnvT):
+    """seek_ge back to a consumed key rereads from it, not from the cursor.
+
+    The scan buffers a page (a, b, c), the caller reads a and b, then seeks back
+    to a. The next read must return a. The pre-fix scan only moved the cursor
+    forward, so it returned c and silently skipped a.
+    """
+    listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap)))
+    connect_cap = net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap)))
+
+    var attempts = 0
+    var bind_port = 0
+    var done = False
+    var handle: ?swdb.Scan = None
+    var store: ?swetcd.EtcdStore = None
+    var server: ?MockEtcdServer = None
+
+    def drop_error(error: ?Exception) -> None:
+        pass
+
+    def teardown() -> None:
+        s = store
+        if s is not None:
+            s.close(drop_error)
+        srv = server
+        if srv is not None:
+            srv.close()
+
+    def fail(message: str) -> None:
+        if done:
+            return
+        done = True
+        teardown()
+        t.failure(ValueError(message))
+
+    def succeed() -> None:
+        if done:
+            return
+        done = True
+        teardown()
+        t.success()
+
+    def key_of(record: ?(key: bytes, value: bytes)) -> ?bytes:
+        if record is not None:
+            return record.key
+        return None
+
+    def read_after_seek(record: ?(key: bytes, value: bytes), error: ?Exception) -> None:
+        if error is not None:
+            fail("read after seek errored")
+            return
+        if key_of(record) != b"a":
+            fail("seek_ge(a) must reread a, not the cursor's row")
+            return
+        succeed()
+
+    def got_b(record: ?(key: bytes, value: bytes), error: ?Exception) -> None:
+        if error is not None:
+            fail("second read errored")
+            return
+        if key_of(record) != b"b":
+            fail("second read expected b")
+            return
+        h = handle
+        if h is not None:
+            h.seek_ge(b"a")
+            h.next(read_after_seek)
+
+    def got_a(record: ?(key: bytes, value: bytes), error: ?Exception) -> None:
+        if error is not None:
+            fail("first read errored")
+            return
+        if key_of(record) != b"a":
+            fail("first read expected a")
+            return
+        h = handle
+        if h is not None:
+            h.next(got_b)
+
+    def bind() -> None:
+        attempts += 1
+        p = random.randint(20000, 45000)
+        bind_port = p
+        server = MockEtcdServer(listen_cap, p, SCAN_BODY, on_ready)
+
+    def on_ready(error: ?str) -> None:
+        if error is not None:
+            if attempts < 10:
+                bind()
+            else:
+                fail("mock server could not bind after {attempts} attempts: {error}")
+            return
+        st = swetcd.EtcdStore(connect_cap, "127.0.0.1", bind_port, b"p")
+        store = st
+        reader = st.read()
+        h = reader.scan(b"", None)
+        handle = h
+        h.next(got_a)
+
+    def timeout() -> None:
+        if done:
+            return
+        fail("timed out reading the scan")
 
     bind()
     after 10.0: timeout()
